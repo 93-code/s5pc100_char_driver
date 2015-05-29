@@ -76,12 +76,16 @@
 //resource 
 #include <linux/ioport.h>
 #include <linux/io.h>
+//自旋锁
+#include <linux/spinlock.h>
+
 // 1.1 属性
 struct led_cdev{
 	struct cdev cdev;
 	
 	int on;                     // 0-turn off  1-turn on
 
+    spinlock_t lock;    
     struct resource *res;  //保存获得的资源(物理地址等)
     void __iomem *regs;   //保存设备获得的虚拟地址
 };
@@ -102,9 +106,9 @@ MODULE_PARM_DESC(led_major, "led device major");
 /********************************************************************/
 
 /********************LED 操作****************************************/
-void led_dev_init(struct led_cdev *led)
+void led_dev_init(struct led_cdev *led, int minor)
 {
-    int pos = (MINOR(led->cdev.dev) + 1) << 2;
+    int pos = (minor + 1) << 2;
     unsigned long LED_CON;
     unsigned long LED_DAT;
 
@@ -116,7 +120,7 @@ void led_dev_init(struct led_cdev *led)
     //gpio data
 
     LED_DAT = readl(led->regs + 4);
-    LED_DAT &= ~(0x1 << (MINOR(led->cdev.dev) + 1));
+    LED_DAT &= ~(0x1 << (minor + 1));
     writel(LED_DAT, led->regs + 4);
     
     led->on = 0;
@@ -157,11 +161,17 @@ void led_dev_off(struct led_cdev *led)
  *                  @li 0                         vfs返回文件描述符给应用程序
  *                  @li < 0												vfs将错误码放入errno，并且返回-1给应用程序
  */
+//缺陷：每次调用open都创建一个文件描述符
 int led_open(struct inode *inode, struct file *filp)
 {
     /*********************************************************/
     struct led_cdev *led = container_of(inode->i_cdev, struct led_cdev, cdev);
+    inode->i_private = led;
+
+    //获得与释放锁
+    spin_lock(&led->lock);
     led_dev_on(led);
+    spin_unlock(&led->lock);
     /*********************************************************/
 	printk("%s\n", __func__);
 	
@@ -181,9 +191,14 @@ int led_open(struct inode *inode, struct file *filp)
  */
 int led_release(struct inode *inode, struct file *filp)
 {
-    struct led_cdev *led = container_of(inode->i_cdev, struct led_cdev, cdev);
+    //struct led_cdev *led = container_of(inode->i_cdev, struct led_cdev, cdev);
+    struct led_cdev *led = inode->i_private;
 
+    //获得与释放锁
+    spin_lock(&led->lock);
     led_dev_off(led);	
+    spin_unlock(&led->lock);
+
 	printk("%s\n", __func__);
 	return 0;
 }
@@ -267,9 +282,13 @@ int led_probe(struct platform_device *pdev)
 	cdev_init(&led->cdev, &fops);
 	led->cdev.owner = THIS_MODULE;
 	
+   /************************led_init*******************************/
+    led_dev_init(led, MINOR(devno));
+   /************************led_init*******************************/
+    	
+    //初始化自旋锁
+    spin_lock_init(&led->lock);
 	
-	
-	// 3.1 申请设备号(思考: 申请失败，需要做什么事情？)
 /*
  * @brief						分配设备编号
  * @param[in]				first												起始设备编号
@@ -307,9 +326,6 @@ int led_probe(struct platform_device *pdev)
        goto err_device_create;
    }
 	
-   /************************led_init*******************************/
-    led_dev_init(led);
-   /************************led_init*******************************/
 	goto exit;
 
 err_device_create:
@@ -339,7 +355,7 @@ exit:
 int led_remove(struct platform_device *pdev)
 {
 	struct led_cdev *led;
-    struct resource *res;
+    //struct resource *res;
 	printk("%s\n", __func__);
 
 	
@@ -372,8 +388,8 @@ int led_remove(struct platform_device *pdev)
     //取消映射
     iounmap(led->regs);
     //释放io内存
-    res = led->res;
-    release_mem_region(res->start, resource_size(res));
+  //  res = led->res;
+ //   release_mem_region(res->start, resource_size(res));
 
 /*
  * @brief 			释放内存
